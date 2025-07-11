@@ -3,6 +3,7 @@
 #include <Storages/MergeTree/GinIndexStore.h>
 #include <Columns/ColumnString.h>
 #include <Common/FST.h>
+#include "base/types.h"
 #include <Compression/CompressionFactory.h>
 #include <Compression/ICompressionCodec.h>
 #include <DataTypes/DataTypeArray.h>
@@ -10,9 +11,11 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
+#include <IO/VarInt.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/WriteBufferFromVector.h>
 #include <IO/WriteHelpers.h>
+#include <boost/dynamic_bitset/dynamic_bitset.hpp>
 #include <vector>
 #include <unordered_map>
 #include <algorithm>
@@ -35,122 +38,180 @@ const CompressionCodecPtr & GinIndexCompressionFactory::zstdCodec()
     return codec;
 }
 
-GinIndexPostingsBuilder::GinIndexPostingsBuilder(UInt64 limit)
-    : rowid_lst{}
-    , size_limit(limit)
-{}
-
 bool GinIndexPostingsBuilder::contains(UInt32 row_id) const
 {
-    if (useRoaring())
-        return rowid_bitmap.contains(row_id);
-
-    const auto it = std::find(rowid_lst.begin(), rowid_lst.begin() + rowid_lst_length, row_id);
-    return it != rowid_lst.begin() + rowid_lst_length;
+    return rowid_bitmap.contains(row_id);
 }
 
 void GinIndexPostingsBuilder::add(UInt32 row_id)
 {
-    if (containsAllRows())
-        return;
-
-    if (useRoaring())
-    {
-        if (rowid_bitmap.cardinality() == size_limit)
-        {
-            /// reset the postings list with MATCH ALWAYS;
-            rowid_lst_length = 1; /// makes sure useRoaring() returns false;
-            rowid_lst[0] = CONTAINS_ALL; /// set CONTAINS_ALL flag;
-        }
-        else
-            rowid_bitmap.add(row_id);
-    }
-    else
-    {
-        assert(rowid_lst_length < MIN_SIZE_FOR_ROARING_ENCODING);
-        rowid_lst[rowid_lst_length] = row_id;
-        rowid_lst_length++;
-
-        if (rowid_lst_length == MIN_SIZE_FOR_ROARING_ENCODING)
-        {
-            for (size_t i = 0; i < rowid_lst_length; i++)
-                rowid_bitmap.add(rowid_lst[i]);
-
-            rowid_lst_length = USES_BIT_MAP;
-        }
-    }
+    rowid_bitmap.add(row_id);
 }
 
 UInt64 GinIndexPostingsBuilder::serialize(WriteBuffer & buffer)
 {
-    UInt64 written_bytes = 0;
-    buffer.write(rowid_lst_length);
-    written_bytes += 1;
+    rowid_bitmap.runOptimize();
+    UInt64 header = 0;
 
-    if (useRoaring())
+    const UInt32 rowid_min = rowid_bitmap.minimum();
+    const UInt32 rowid_max = rowid_bitmap.maximum();
+    const UInt32 range_size = (rowid_max - rowid_min) + 1;
+
+    using block_type = boost::dynamic_bitset<UInt64>::block_type;
+    const UInt64 required_blocks_for_bitset = (range_size + 63) / 64; // each block has 64 entries.
+
+    const UInt64 bitset_size_in_bytes = required_blocks_for_bitset * sizeof(block_type);
+    const UInt64 roaring_bitmap_size_in_bytes = rowid_bitmap.getSizeInBytes();
+
+    if (bitset_size_in_bytes < roaring_bitmap_size_in_bytes)
     {
-        rowid_bitmap.runOptimize();
-        auto size = rowid_bitmap.getSizeInBytes();
-        auto buf = std::make_unique<char[]>(size);
-        rowid_bitmap.write(buf.get());
+        header = (header << 1) | 0x1; // use dynamic_bitset
+
+        boost::dynamic_bitset<> bitset(range_size);
+        for (const auto rowid : rowid_bitmap)
+            bitset.set(rowid - rowid_min);
+
+        std::vector<block_type> blocks(bitset.num_blocks());
+        boost::to_block_range(bitset, blocks.begin());
+
+        const bool compress = bitset.count() >= DYNAMIC_BITSET_COMPRESSION_CARDINALITY_THRESHOLD;
+        const UInt64 uncompressed_size = blocks.size() * sizeof(block_type);
+
+        header |= (blocks.size() << 1);
+        if (compress)
+        {
+            header |= 0x1; // compressed
+
+            const auto & codec = GinIndexCompressionFactory::zstdCodec();
+            Memory<> memory;
+            memory.resize(codec->getCompressedReserveSize(static_cast<UInt32>(uncompressed_size)));
+            UInt64 compressed_size = codec->compress(reinterpret_cast<char *>(blocks.data()), uncompressed_size, memory.data());
+
+            writeVarUInt(header, buffer);
+            writeVarUInt(rowid_min, buffer);
+            writeVarUInt(compressed_size, buffer);
+            buffer.write(memory.data(), compressed_size);
+            return getLengthOfVarUInt(header) + getLengthOfVarUInt(rowid_min) + getLengthOfVarUInt(compressed_size) + compressed_size;
+        }
+        else
+        {
+            header |= 0x0; // no compressed
+
+            writeVarUInt(header, buffer);
+            writeVarUInt(rowid_min, buffer);
+            buffer.write(reinterpret_cast<char *>(blocks.data()), uncompressed_size);
+            return getLengthOfVarUInt(header) + getLengthOfVarUInt(rowid_min) + uncompressed_size;
+        }
+    }
+    header = (header << 1) | 0x0; // Use roaring bitmap
+
+    const bool compress = rowid_bitmap.cardinality() >= ROARING_BITMAP_COMPRESSION_CARDINALITY_THRESHOLD;
+    const UInt64 uncompressed_size = rowid_bitmap.getSizeInBytes();
+
+    auto buf = std::make_unique<char[]>(uncompressed_size);
+    rowid_bitmap.write(buf.get());
+
+    header |= uncompressed_size << 1;
+    if (compress)
+    {
+        header |= 0x1; // compressed
 
         const auto & codec = GinIndexCompressionFactory::zstdCodec();
         Memory<> memory;
-        memory.resize(codec->getCompressedReserveSize(static_cast<UInt32>(size)));
-        auto compressed_size = codec->compress(buf.get(), static_cast<UInt32>(size), memory.data());
+        memory.resize(codec->getCompressedReserveSize(static_cast<UInt32>(uncompressed_size)));
+        auto compressed_size = codec->compress(buf.get(), static_cast<UInt32>(uncompressed_size), memory.data());
 
-        writeVarUInt(size, buffer);
-        written_bytes += getLengthOfVarUInt(size);
-
+        writeVarUInt(header, buffer);
         writeVarUInt(compressed_size, buffer);
-        written_bytes += getLengthOfVarUInt(compressed_size);
-
         buffer.write(memory.data(), compressed_size);
-        written_bytes += compressed_size;
+
+        return getLengthOfVarUInt(header) + getLengthOfVarUInt(compressed_size) + compressed_size;
     }
     else
     {
-        for (size_t i = 0; i <  rowid_lst_length; ++i)
-        {
-            writeVarUInt(rowid_lst[i], buffer);
-            written_bytes += getLengthOfVarUInt(rowid_lst[i]);
-        }
-    }
+        header |= 0x0; // no compressed
 
-    return written_bytes;
+        writeVarUInt(header, buffer);
+        buffer.write(buf.get(), uncompressed_size);
+
+        return getLengthOfVarUInt(header) + uncompressed_size;
+    }
 }
 
 GinIndexPostingsListPtr GinIndexPostingsBuilder::deserialize(ReadBuffer & buffer)
 {
-    UInt8 postings_list_size = 0;
-    buffer.readStrict(reinterpret_cast<char &>(postings_list_size));
+    GinIndexPostingsListPtr postings_list = std::make_shared<GinIndexPostingsList>();
 
-    if (postings_list_size == USES_BIT_MAP)
+    UInt64 header;
+    readVarUInt(header, buffer);
+
+    const bool use_dynamic_bitset = header & 0x1;
+    header >>= 1;
+    const bool compressed = header & 0x1;
+
+    if (use_dynamic_bitset)
     {
-        size_t size = 0;
+        UInt32 num_blocks = (header >> 1);
+        UInt64 rowid_min = 0;
+        readVarUInt(rowid_min, buffer);
+
+        using block_type = boost::dynamic_bitset<>::block_type;
+        std::vector<block_type> blocks(num_blocks);
+        if (compressed)
+        {
+            UInt64 compressed_size = 0;
+            readVarUInt(compressed_size, buffer);
+
+            Memory<> memory(compressed_size);
+            buffer.readStrict(memory.data(), compressed_size);
+            const auto & codec = DB::GinIndexCompressionFactory::zstdCodec();
+            codec->decompress(memory.data(), static_cast<UInt32>(compressed_size), reinterpret_cast<char *>(blocks.data()));
+        }
+        else
+        {
+            const UInt64 uncompressed_size = blocks.size() * sizeof(block_type);
+            buffer.readStrict(reinterpret_cast<char *>(blocks.data()), uncompressed_size);
+        }
+
+        const size_t bits_per_block = sizeof(block_type) * 8;
+        for (size_t block_idx = 0; const auto & block : blocks)
+        {
+            if (block == 0)
+                continue;
+
+            const size_t block_base = rowid_min + (block_idx * bits_per_block);
+            for (size_t offset = 0; offset < bits_per_block; ++offset)
+                if (block & (block_type(1) << offset))
+                    postings_list->add(block_base + offset);
+            ++block_idx;
+        }
+
+        return postings_list;
+    }
+
+    const UInt64 uncompressed_size = (header >> 1);
+    if (compressed)
+    {
         size_t compressed_size = 0;
-        readVarUInt(size, buffer);
         readVarUInt(compressed_size, buffer);
         auto buf = std::make_unique<char[]>(compressed_size);
         buffer.readStrict(reinterpret_cast<char *>(buf.get()), compressed_size);
 
         Memory<> memory;
-        memory.resize(size);
+        memory.resize(uncompressed_size);
         const auto & codec = GinIndexCompressionFactory::zstdCodec();
         codec->decompress(buf.get(), static_cast<UInt32>(compressed_size), memory.data());
 
-        GinIndexPostingsListPtr postings_list = std::make_shared<GinIndexPostingsList>(GinIndexPostingsList::read(memory.data()));
+        postings_list = std::make_shared<GinIndexPostingsList>(GinIndexPostingsList::read(memory.data()));
+    }
+    else
+    {
+        auto buf = std::make_unique<char[]>(uncompressed_size);
+        buffer.readStrict(reinterpret_cast<char *>(buf.get()), uncompressed_size);
 
-        return postings_list;
+        postings_list = std::make_shared<GinIndexPostingsList>(GinIndexPostingsList::read(buf.get()));
     }
 
-    assert(postings_list_size < MIN_SIZE_FOR_ROARING_ENCODING);
-    GinIndexPostingsListPtr postings_list = std::make_shared<GinIndexPostingsList>();
-    UInt32 row_ids[MIN_SIZE_FOR_ROARING_ENCODING];
-
-    for (auto i = 0; i < postings_list_size; ++i)
-        readVarUInt(row_ids[i], buffer);
-    postings_list->addMany(postings_list_size, row_ids);
     return postings_list;
 }
 
