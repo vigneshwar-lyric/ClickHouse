@@ -706,7 +706,7 @@ bool Client::buzzHouse()
                     {
                         /// Dump table content and read it later to look for correctness
                         full_query2.resize(0);
-                        qo.dumpTableContent(rg, gen, t1, sq1);
+                        qo.dumpTableContent(rg, gen, test_content, t1, sq1);
                         BuzzHouse::SQLQueryToString(full_query2, sq1);
                         fuzz_config->outf << full_query2 << std::endl;
                         server_up &= processBuzzHouseQuery(full_query2);

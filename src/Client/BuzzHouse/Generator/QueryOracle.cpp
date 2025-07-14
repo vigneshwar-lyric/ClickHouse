@@ -160,14 +160,16 @@ void QueryOracle::insertOnTableOrCluster(
 }
 
 /// Dump and read table oracle
-void QueryOracle::dumpTableContent(RandomGenerator & rg, StatementGenerator & gen, const SQLTable & t, SQLQuery & sq1)
+void QueryOracle::dumpTableContent(
+    RandomGenerator & rg, StatementGenerator & gen, const bool test_content, const SQLTable & t, SQLQuery & sq1)
 {
     bool first = true;
     TopSelect * ts = sq1.mutable_single_query()->mutable_explain()->mutable_inner_query()->mutable_select();
     SelectIntoFile * sif = ts->mutable_intofile();
-    SelectStatementCore * sel = ts->mutable_sel()->mutable_select_core();
-    JoinedTableOrFunction * jtf = sel->mutable_from()->mutable_tos()->mutable_join_clause()->mutable_tos()->mutable_joined_table();
-    OrderByList * obs = sel->mutable_orderby()->mutable_olist();
+    Select * sel = ts->mutable_sel();
+    SelectStatementCore * ssc = sel->mutable_select_core();
+    JoinedTableOrFunction * jtf = ssc->mutable_from()->mutable_tos()->mutable_join_clause()->mutable_tos()->mutable_joined_table();
+    OrderByList * obs = ssc->mutable_orderby()->mutable_olist();
 
     insertOnTableOrCluster(rg, gen, t, false, jtf->mutable_tof());
     jtf->set_final(t.supportsFinal());
@@ -178,7 +180,7 @@ void QueryOracle::dumpTableContent(RandomGenerator & rg, StatementGenerator & ge
     {
         ExprOrderingTerm * eot = first ? obs->mutable_ord_term() : obs->add_extra_ord_terms();
 
-        gen.columnPathRef(entry, sel->add_result_columns()->mutable_etc()->mutable_col()->mutable_path());
+        gen.columnPathRef(entry, ssc->add_result_columns()->mutable_etc()->mutable_col()->mutable_path());
         gen.columnPathRef(entry, eot->mutable_expr()->mutable_comp_expr()->mutable_expr_stc()->mutable_col()->mutable_path());
         if (rg.nextBool())
         {
@@ -194,7 +196,21 @@ void QueryOracle::dumpTableContent(RandomGenerator & rg, StatementGenerator & ge
     }
     gen.entries.clear();
 
-    addLimitOrOffset(rg, gen, ncols, sel);
+    addLimitOrOffset(rg, gen, ncols, ssc);
+    if (test_content)
+    {
+        /// Don't write statistics
+        if (!sel->has_setting_values())
+        {
+            const auto * news = sel->mutable_setting_values();
+            UNUSED(news);
+        }
+        SettingValues & svs = const_cast<SettingValues &>(sel->setting_values());
+        SetValue * sv = svs.has_set_value() ? svs.add_other_values() : svs.mutable_set_value();
+
+        sv->set_property("output_format_write_statistics");
+        sv->set_value("0");
+    }
     ts->set_format(rg.pickRandomly(StatementGenerator::outIn));
     sif->set_path(qcfile.generic_string());
     sif->set_step(SelectIntoFile_SelectIntoFileStep::SelectIntoFile_SelectIntoFileStep_TRUNCATE);
