@@ -294,26 +294,79 @@ void QueryOracle::generateExportQuery(
     jtf->set_final(t.supportsFinal());
 }
 
-void QueryOracle::dumpOracleIntermediateStep(
-    RandomGenerator & rg, StatementGenerator & gen, const SQLTable & t, const bool use_optimize, SQLQuery & sq3)
+void QueryOracle::dumpOracleIntermediateSteps(
+    RandomGenerator & rg,
+    StatementGenerator & gen,
+    const SQLTable & t,
+    const DumpOracleStrategy strategy,
+    const bool test_content,
+    std::vector<SQLQuery> & intermediate_queries)
 {
-    SQLQueryInner * sq = sq3.mutable_single_query()->mutable_explain()->mutable_inner_query();
-
-    if (use_optimize)
+    intermediate_queries.clear();
+    switch (strategy)
     {
-        gen.generateNextOptimizeTableInternal(rg, t, true, sq->mutable_opt());
-    }
-    else
-    {
-        /// Truncate table, then insert everything again
-        const std::optional<String> & cluster = t.getCluster();
-        Truncate * trunc = sq->mutable_trunc();
+        case DumpOracleStrategy::DUMP_TABLE: {
+            SQLQuery next1, next2, next3;
+            const std::optional<String> & cluster = t.getCluster();
+            const auto & t2
+                = test_content ? t : rg.pickRandomly(gen.filterCollection<BuzzHouse::SQLTable>(gen.attached_tables_to_test_format)).get();
 
-        t.setName(trunc->mutable_est(), false);
-        if (cluster.has_value())
-        {
-            trunc->mutable_cluster()->set_cluster(cluster.value());
+            /// Export data
+            generateExportQuery(rg, gen, test_content, t, next1);
+            /// Truncate table, then insert everything again
+            Truncate * trunc = next2.mutable_single_query()->mutable_explain()->mutable_inner_query()->mutable_trunc();
+
+            t.setName(trunc->mutable_est(), false);
+            if (cluster.has_value())
+            {
+                trunc->mutable_cluster()->set_cluster(cluster.value());
+            }
+            /// Import data again
+            generateImportQuery(rg, gen, t2, next1, next3);
+
+            intermediate_queries.emplace_back(next1);
+            intermediate_queries.emplace_back(next2);
+            intermediate_queries.emplace_back(next3);
         }
+        break;
+        case DumpOracleStrategy::OPTIMIZE: {
+            SQLQuery next;
+
+            gen.generateNextOptimizeTableInternal(
+                rg, t, true, next.mutable_single_query()->mutable_explain()->mutable_inner_query()->mutable_opt());
+            intermediate_queries.emplace_back(next);
+        }
+        break;
+        case DumpOracleStrategy::REATTACH: {
+            SQLQuery next1, next2;
+            const std::optional<String> & cluster = t.getCluster();
+            Detach * det = next1.mutable_single_query()->mutable_explain()->mutable_inner_query()->mutable_detach();
+            Attach * att = next2.mutable_single_query()->mutable_explain()->mutable_inner_query()->mutable_attach();
+
+            det->set_sobject(SQLObject::TABLE);
+            att->set_sobject(SQLObject::TABLE);
+            t.setName(det->mutable_object()->mutable_est(), false);
+            t.setName(att->mutable_object()->mutable_est(), false);
+
+            det->set_permanently(rg.nextSmallNumber() < 4);
+            det->set_sync(true);
+            if (cluster.has_value())
+            {
+                det->mutable_cluster()->set_cluster(cluster.value());
+                att->mutable_cluster()->set_cluster(cluster.value());
+            }
+            if (rg.nextSmallNumber() < 4)
+            {
+                gen.generateSettingValues(rg, serverSettings, det->mutable_setting_values());
+            }
+            if (rg.nextSmallNumber() < 4)
+            {
+                gen.generateSettingValues(rg, serverSettings, att->mutable_setting_values());
+            }
+            intermediate_queries.emplace_back(next1);
+            intermediate_queries.emplace_back(next2);
+        }
+        break;
     }
 }
 
