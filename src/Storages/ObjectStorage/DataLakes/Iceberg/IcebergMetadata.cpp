@@ -201,21 +201,23 @@ static std::pair<Int32, String> getMetadataFileAndVersion(const std::string & pa
     if (file_name.starts_with('v'))
         version_str = String(file_name.begin() + 1, file_name.begin() + file_name.find_first_of('.'));
     /// <V>-<random-uuid>.metadata.json
-    else
+    else if (isdigit(file_name[0]))
         version_str = String(file_name.begin(), file_name.begin() + file_name.find_first_of('-'));
+    else
+        return std::make_pair(0, path); /// <uuid>.metadata.json
 
     if (!std::all_of(version_str.begin(), version_str.end(), isdigit))
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS, "Bad metadata file name: {}. Expected vN.metadata.json where N is a number", file_name);
+        return std::make_pair(0, path);
 
     return std::make_pair(std::stoi(version_str), path);
 }
 
 /**
  * Each version of table metadata is stored in a `metadata` directory and
- * has one of 2 formats:
+ * has one of 3 formats:
  *   1) v<V>.metadata.json, where V - metadata version.
- *   2) <V>-<random-uuid>.metadata.json, where V - metadata version
+ *   2) <V>-<random-uuid>.metadata.json, where V - metadata version.
+ *   3) <uuid>.metadata.json, metadata version is assumed to be 0.
  */
 static std::pair<Int32, String>
 getLatestMetadataFileAndVersion(const ObjectStoragePtr & object_storage, const StorageObjectStorage::Configuration & configuration)
