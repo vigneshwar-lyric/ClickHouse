@@ -72,7 +72,6 @@ private:
             ProfileEvents::increment(ProfileEvents::DiskAzureListObjects);
 
         batch.clear();
-        auto outcome = client->ListBlobs(options);
         auto blob_list_response = client->ListBlobs(options);
         auto blobs_list = blob_list_response.Blobs;
 
@@ -171,7 +170,6 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
         if (client_ptr->IsClientForDisk())
             ProfileEvents::increment(ProfileEvents::DiskAzureListObjects);
 
-        blob_list_response = client_ptr->ListBlobs(options);
         const auto & blobs_list = blob_list_response.Blobs;
 
         for (const auto & blob : blobs_list)
@@ -187,13 +185,8 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
                     {}}));
         }
 
-        if (max_keys)
-        {
-            size_t keys_left = max_keys - children.size();
-            if (keys_left <= 0)
-                break;
-            options.PageSizeHint = keys_left;
-        }
+        if (max_keys && children.size() >= max_keys)
+            break;
     }
 }
 
