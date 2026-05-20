@@ -199,7 +199,7 @@ static std::pair<Int32, String> getMetadataFileAndVersion(const std::string & pa
     String version_str;
     /// v<V>.metadata.json
     if (file_name.starts_with('v'))
-        version_str = String(file_name.begin() + 1, file_name.begin() + file_name.find_first_of('.'));
+        return std::make_pair(0, path);
     /// <V>-<random-uuid>.metadata.json
     else
         version_str = String(file_name.begin(), file_name.begin() + file_name.find_first_of('-'));
