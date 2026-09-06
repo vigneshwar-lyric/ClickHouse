@@ -15,6 +15,7 @@
 #include <boost/algorithm/string/case_conv.hpp>
 #include <Common/Exception.h>
 #include <parquet/metadata.h>
+#include <Processors/Formats/Impl/IcebergCompatibleName.h>
 
 
 namespace arrow
@@ -92,6 +93,20 @@ public:
             std::string col_name = named_col.name;
             if (ignore_case)
                 boost::to_lower(col_name);
+            /// Iceberg writes physical Parquet field names sanitized to Avro-compatible
+            /// form (e.g. "col.with.dot" -> "col_x2Ewith_x2Edot"). If the logical name is
+            /// not a field but its sanitized form is, select the sanitized field so its
+            /// values are read instead of the column resolving to NULL. Self-gating: only
+            /// applies when the literal name is absent and the sanitized name is present,
+            /// so plain Parquet/ORC reads and real struct paths are unaffected.
+            if (!fields_indices.contains(col_name))
+            {
+                std::string sanitized = icebergMakeCompatibleName(named_col.name);
+                if (ignore_case)
+                    boost::to_lower(sanitized);
+                if (sanitized != col_name && fields_indices.contains(sanitized))
+                    col_name = sanitized;
+            }
             findRequiredIndices(col_name, i, named_col.type, fields_indices, added_indices, required_indices, file);
         }
         return required_indices;
