@@ -1,4 +1,5 @@
 #include "ArrowColumnToCHColumn.h"
+#include <Processors/Formats/Impl/IcebergCompatibleName.h>
 
 #if USE_ARROW || USE_ORC || USE_PARQUET
 
@@ -1375,6 +1376,21 @@ Chunk ArrowColumnToCHColumn::arrowColumnsToCHChunk(const NameToArrowColumn & nam
         auto search_column_name = header_column.name;
         if (case_insensitive_matching)
             boost::to_lower(search_column_name);
+
+        /// Iceberg stores physical Parquet/Arrow column names sanitized to Avro-compatible
+        /// form (e.g. "col.with.dot" -> "col_x2Ewith_x2Edot"). If the logical name is not
+        /// present but its sanitized form is, match the sanitized column so its values are
+        /// read (else the column resolves to NULL). Output keeps the logical name below.
+        /// Self-gating: only fires when the literal name is absent and the sanitized name
+        /// is present, so plain Parquet/ORC reads are unaffected.
+        if (!name_to_arrow_column.contains(search_column_name))
+        {
+            auto sanitized = icebergMakeCompatibleName(header_column.name);
+            if (case_insensitive_matching)
+                boost::to_lower(sanitized);
+            if (sanitized != search_column_name && name_to_arrow_column.contains(sanitized))
+                search_column_name = sanitized;
+        }
 
         ColumnWithTypeAndName column;
         if (!name_to_arrow_column.contains(search_column_name))
